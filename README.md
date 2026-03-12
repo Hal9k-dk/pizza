@@ -1,131 +1,95 @@
-# Google Sheets Order Extractor
+# Pizza Order Automation
 
-A simple, lightweight Python script to extract **itemized orders** from a public Google Spreadsheet.
+Two scripts for automating group pizza orders at Hal9k:
 
-This script intelligently filters the spreadsheet to extract only actual customer orders, skipping:
-- Metadata and headers
-- Empty order slots
-- Payment fees
-- Totals and summary rows
-- Option lists
+1. **`extract-orders`** — pulls the order list from a public Google Spreadsheet
+2. **`place-orders`** — opens a browser and automatically adds every item to the cart on skalborgpizza.dk
 
-## Why this approach?
+## How it works
 
-For **public** Google Sheets, we don't need authentication! This script uses Google's CSV export feature - no API keys, no service accounts, no complexity. Just a spreadsheet URL and `requests`.
+Orders are collected in a Google Spreadsheet. `extract-orders` downloads it (no API key needed — it uses the public CSV export endpoint) and filters out metadata rows, leaving only the actual orders.
+
+`place-orders` then reads those orders and drives a Playwright browser through the pizza site: scraping the menu, opening each item, selecting the right size/variant, ticking any modification checkboxes, and adding it to the cart. When all items are in, the browser is left open for you to review and submit the order.
 
 ## Setup
 
-### 1. Install Dependencies
-
-Using [uv](https://github.com/astral-sh/uv):
+### 1. Install dependencies
 
 ```bash
 uv sync
 ```
 
-Or with pip:
+Then install the Playwright browser:
+
 ```bash
-pip install -e .
+uv run playwright install chromium
 ```
 
-### 2. Configure Your Spreadsheet URL
+### 2. Configure `.env`
 
-Add to `.env`:
 ```
 ORDER_SHEET_URL=https://docs.google.com/spreadsheets/d/YOUR_SHEET_ID/edit
+PIZZA_PLACE=https://skalborgpizza.dk
 ```
 
-That's it! No credentials needed.
+The spreadsheet must be publicly readable (no credentials are used).
 
 ## Usage
 
-### Print orders to console (readable format)
+### Extract orders
+
+Print a summary to the terminal:
+
 ```bash
 extract-orders
 ```
 
-Shows a nicely formatted summary with:
-- Customer name
-- Pizza selection
-- Modifications/toppings
-- Price (numeric and text)
-- Payment status (✓/✗)
-- Total count and revenue
+Save as JSON or CSV:
 
-### Save as JSON
 ```bash
 extract-orders --format json --output orders.json
+extract-orders --format csv  --output orders.csv
 ```
 
-Each order includes:
-- `Navn` - Customer name
-- `Nr` - Pizza/item number with name
-- `Tilbehør` - Modifications/toppings (if any)
-- `Pris` - Price as number
-- `Pris (tekst)` - Price as text (e.g., "90 kr.")
-- `Betalt` - Payment status (true/false)
-- Other spreadsheet columns
+Override the spreadsheet URL without editing `.env`:
 
-### Save as CSV
-```bash
-extract-orders --format csv --output orders.csv
-```
-
-### Use custom URL (without .env)
 ```bash
 extract-orders --url https://docs.google.com/spreadsheets/d/YOUR_SHEET_ID/edit
 ```
 
-## Environment Variables
+### Place orders
 
-The script reads `ORDER_SHEET_URL` from `.env`:
-```
-ORDER_SHEET_URL=https://docs.google.com/spreadsheets/d/...
+```bash
+place-orders
 ```
 
-## File Structure
+This will:
+
+1. Fetch the current order list from the spreadsheet
+2. Open a visible Chromium browser on the pizza site
+3. Accept the cookie banner and select pickup (Afhentning)
+4. Add every order to the cart, including modifications
+5. Leave the browser open — review the cart and submit the order yourself, then press Enter to close the browser
+
+## Spreadsheet format
+
+The script expects a sheet with a header row containing at least these columns:
+
+| Column | Description |
+|---|---|
+| `Navn` | Customer name |
+| `Nr` | Pizza number and name (e.g. `9 - Rose`, `12A - Freyas Pizza`) |
+| `Tilbehør` | Comma-separated modifications (e.g. `chili, hvidløg`) |
+| `Pris` | Price in kr. |
+| `Betalt` | `TRUE`/`FALSE` payment status |
+
+## Project structure
 
 ```
 pizza/
-├── .env                    # Contains ORDER_SHEET_URL
-├── pyproject.toml          # Project configuration (PEP 621)
-├── extract_orders.py       # Main script
-├── uv.lock                 # (Auto-generated) UV lock file
-└── README.md              # This file
+├── extract_orders.py   # Spreadsheet extraction
+├── place_orders.py     # Browser automation
+├── pyproject.toml      # Project config and dependencies
+├── .env                # ORDER_SHEET_URL and PIZZA_PLACE (not committed)
+└── uv.lock             # Locked dependencies
 ```
-
-## Development
-
-### Install with dev dependencies
-
-```bash
-uv sync --all-extras
-```
-
-### Run linting and formatting
-
-```bash
-# Format code with black
-uv run black extract_orders.py
-
-# Lint with ruff
-uv run ruff check extract_orders.py
-
-# Fix issues automatically
-uv run ruff check --fix extract_orders.py
-```
-
-### Run tests (if added)
-
-```bash
-uv run pytest
-```
-
-## Why uv?
-
-[uv](https://github.com/astral-sh/uv) is a fast, reliable Python package installer and resolver:
-- **10-100x faster** than pip
-- **Single tool** for package management, virtual environments, and project configuration
-- **PEP 621 compatible** - uses modern `pyproject.toml` instead of multiple config files
-- **Lock files** - reproducible dependencies across machines
-- **Python version management** - optional built-in Python discovery
