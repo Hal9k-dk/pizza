@@ -85,7 +85,14 @@ def select_variant(page: Page, select_prefix: str | None) -> None:
     variant via an inline <script>, so we only call select_option() when a
     *different* variant is needed — calling it unnecessarily would fire
     showItemToppings() a second time and overwrite any checkboxes we already
-    ticked.  Either way we wait for checkboxes to appear in #divToppings."""
+    ticked.  Either way we wait for checkboxes to appear in #divToppings.
+
+    select_prefix matching:
+      - None          → pick the first option whose text starts with "alm" (normal size)
+      - "132"         → numbered variant: pick option whose text starts with "132"
+      - "Fuldkorn"    → named variant: startswith tried first, then case-insensitive
+                        contains (matches "Alm. Fuldkorn - 75.00")
+    """
     select = page.query_selector("#spacial_itm")
     if not select:
         # No size select — toppings load automatically from show_item_details.php
@@ -100,11 +107,19 @@ def select_variant(page: Page, select_prefix: str | None) -> None:
                     options[0]
                 )
             else:
+                # Try startswith first (numeric variants like "132")
                 target = next(
                     (opt for opt in options
                      if opt.inner_text().strip().startswith(select_prefix)),
                     None
                 )
+                # Fall back to case-insensitive contains (named variants like "Fuldkorn")
+                if target is None:
+                    target = next(
+                        (opt for opt in options
+                         if select_prefix.lower() in opt.inner_text().strip().lower()),
+                        None
+                    )
                 if target is None:
                     print(f"    ⚠ variant '{select_prefix}' not found; using first option")
                     target = options[0]
@@ -279,8 +294,12 @@ def place_orders(orders: list[dict], pizza_url: str) -> None:
             # --- Resolve the item ----------------------------------------
             # Nr format: "9 - Rose", "12A - Freyas Pizza",
             #            "Børnepizza 5 - Børnepizza 5", "132 - Pommes Frites Stor"
-            parts = nr.split(" - ", 1)
-            key = parts[0].strip()  # "9", "12A", "Børnepizza 5", "132"
+            # Fuldkorn format: "71 - Durum Kebab - Fuldkorn"
+            #   → key="71", select_prefix overridden to "Fuldkorn"
+            nr_parts = nr.split(" - ")
+            key = nr_parts[0].strip()  # "9", "12A", "Børnepizza 5", "132"
+            # A third segment (e.g. "Fuldkorn") overrides the menu's select_prefix
+            nr_variant = nr_parts[2].strip() if len(nr_parts) > 2 else None
 
             if key not in menu:
                 print(f"    ✗ Item {key!r} not found in menu — skipping\n")
@@ -288,7 +307,7 @@ def place_orders(orders: list[dict], pizza_url: str) -> None:
 
             entry         = menu[key]
             item_id       = entry["item_id"]
-            select_prefix = entry["select_prefix"]
+            select_prefix = nr_variant if nr_variant else entry["select_prefix"]
 
             # --- Open item detail modal ------------------------------------
             # Clear #product_id first so wait_for_function below cannot resolve
