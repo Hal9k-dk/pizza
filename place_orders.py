@@ -7,15 +7,42 @@ Opens a visible browser, fills in all items, then leaves it open for the user to
 import os
 import re
 import sys
+from urllib.parse import urlsplit, urlunsplit
+
 from dotenv import load_dotenv
-from playwright.sync_api import sync_playwright, Page
+from playwright.sync_api import Page, sync_playwright
 
 from extract_orders import extract_orders
+
+# ---------------------------------------------------------------------------
+# URL helpers
+# ---------------------------------------------------------------------------
+
+
+def normalize_menu_url(pizza_url: str) -> str:
+    """
+    Turn the configured pizza URL into the actual menu page URL.
+
+    Users tend to paste either the site root, the real menu URL, or some other
+    ordering/landing page path copied from the browser. The automation only
+    works on the legacy menu page, so normalize everything to /menukort at the
+    site root.
+    """
+    parsed = urlsplit(pizza_url.strip())
+    base_path = parsed.path.rstrip("/")
+
+    if base_path.endswith("/menukort"):
+        menu_path = base_path
+    else:
+        menu_path = "/menukort"
+
+    return urlunsplit((parsed.scheme, parsed.netloc, menu_path, "", ""))
 
 
 # ---------------------------------------------------------------------------
 # Menu scraping
 # ---------------------------------------------------------------------------
+
 
 def scrape_menu(page: Page) -> dict:
     """
@@ -64,10 +91,9 @@ def scrape_menu(page: Page) -> dict:
         if desc_el:
             desc = desc_el.inner_text()
             for vm in re.finditer(r'(\d+)\.\s+(\S+)', desc):
-                variant_num  = vm.group(1)
-                variant_name = vm.group(2)
+                variant_num = vm.group(1)
                 menu[variant_num] = {
-                    "item_id":       item_id,
+                    "item_id": item_id,
                     "select_prefix": variant_num,  # match option text that starts with this
                 }
 
@@ -161,16 +187,23 @@ def apply_modifications(page: Page, mods_text: str) -> None:
             timeout=5000
         )
     except Exception:
-        print(f"    ⚠ no checkboxes appeared — skipping modifications")
+        print("    ⚠ no checkboxes appeared — skipping modifications")
         return
 
     # Do matching and checking entirely in JS to avoid stale element handle issues
-    results = page.evaluate("""
+    results = page.evaluate(
+        """
         (mods) => {
             const results = [];
-            const checkboxes = document.querySelectorAll('#cboxLoadedContent input[type=checkbox]');
+            const checkboxes = document.querySelectorAll(
+                '#cboxLoadedContent input[type=checkbox]'
+            );
             for (const cb of checkboxes) {
-                const labelText = cb.closest('label')?.querySelector('.poptext')?.innerText?.trim() ?? '';
+                const labelText = cb
+                    .closest('label')
+                    ?.querySelector('.poptext')
+                    ?.innerText
+                    ?.trim() ?? '';
                 const labelLower = labelText.toLowerCase();
                 for (const mod of mods) {
                     const words = mod.split(' ');
@@ -191,7 +224,9 @@ def apply_modifications(page: Page, mods_text: str) -> None:
             }
             return results;
         }
-    """, mods)
+        """,
+        mods,
+    )
 
     for r in results:
         if r["found"]:
@@ -207,18 +242,56 @@ def add_to_cart(page: Page) -> None:
     page.wait_for_selector("#cboxOverlay", state="hidden", timeout=10000)
 
 
+def wait_for_menu_ready(page: Page) -> None:
+    """Wait until the actual menu page is interactive."""
+    page.wait_for_function(
+        """
+        () => {
+            const items = document.querySelectorAll("li[onclick*='showItemDetails']");
+            return items.length > 0 && typeof window.showItemDetails === 'function';
+        }
+        """,
+        timeout=20000,
+    )
+
+
+def choose_pickup(page: Page) -> None:
+    """Choose Afhentning in the order-type popup."""
+    pickup_popup_button = "#colorbox input[value='Afhentning']"
+    pickup_page_link = "a[onclick='changemenucard(2);']"
+
+    if page.locator(pickup_popup_button).count():
+        page.click(pickup_popup_button, timeout=5000)
+    else:
+        page.click(pickup_page_link, timeout=5000)
+
+    page.wait_for_selector("#cboxOverlay", state="hidden", timeout=15000)
+
+
 # ---------------------------------------------------------------------------
 # Main ordering flow
 # ---------------------------------------------------------------------------
 
 def place_orders(orders: list[dict], pizza_url: str) -> None:
-    # Always start on the menu page
-    menu_url = pizza_url.rstrip("/") + "/menukort"
+    menu_url = normalize_menu_url(pizza_url)
 
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=False)
         page = browser.new_page()
-        page.goto(menu_url, wait_until="networkidle")
+        page.goto(menu_url, wait_until="domcontentloaded")
+        page.wait_for_load_state("networkidle")
+
+        # Fail fast with a useful message if the configured URL does not land on
+        # the legacy menu page that exposes changemenucard()/showItemDetails().
+        pickup_selector = (
+            "#colorbox input[value='Afhentning'], "
+            "a[onclick='changemenucard(2);']"
+        )
+        if not page.locator(pickup_selector).count():
+            raise RuntimeError(
+                "Configured pizza URL did not open the expected menu page. "
+                f"Opened: {page.url}"
+            )
 
         # 1. Dismiss TermsFeed cookie consent
         try:
@@ -227,9 +300,11 @@ def place_orders(orders: list[dict], pizza_url: str) -> None:
         except Exception:
             pass
 
-        # 2. Dismiss the "Udbringning eller hent selv?" colorbox — choose Afhentning
-        with page.expect_navigation(wait_until="networkidle"):
-            page.evaluate("changemenucard(2)")
+        wait_for_menu_ready(page)
+
+        # 2. Dismiss the "Udbringning eller hent selv?" chooser — choose Afhentning
+        choose_pickup(page)
+        wait_for_menu_ready(page)
         print("✓ Selected 'Afhentning' (pickup)\n")
 
         # 3. Scrape the menu
@@ -313,7 +388,14 @@ def place_orders(orders: list[dict], pizza_url: str) -> None:
             # Clear #product_id first so wait_for_function below cannot resolve
             # with stale content left over from the previous modal (same item_id
             # would otherwise match immediately before show_item_details.php responds).
-            page.evaluate("() => { const el = document.querySelector('#product_id'); if (el) el.value = ''; }")
+            page.evaluate(
+                """
+                () => {
+                    const el = document.querySelector('#product_id');
+                    if (el) el.value = '';
+                }
+                """
+            )
             page.click(f"li[onclick='showItemDetails({item_id})']")
             # Now wait for show_item_details.php to respond and populate fresh content.
             page.wait_for_function(
@@ -329,7 +411,7 @@ def place_orders(orders: list[dict], pizza_url: str) -> None:
 
             # --- Add to cart ---------------------------------------------
             add_to_cart(page)
-            print(f"    ✓ Added to cart\n")
+            print("    ✓ Added to cart\n")
 
         print("=" * 60)
         print(f"✓ All {len(orders)} orders added to cart.")

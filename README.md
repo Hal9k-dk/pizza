@@ -71,6 +71,10 @@ This will:
 4. Add every order to the cart, including modifications
 5. Leave the browser open — review the cart and submit the order yourself, then press Enter to close the browser
 
+The configured `PIZZA_PLACE` may be either the site root (for example
+`https://skalborgpizza.dk`) or the direct menu URL. The script normalizes it to
+`/menukort` automatically.
+
 ## Spreadsheet format
 
 The script expects a sheet with a header row containing at least these columns:
