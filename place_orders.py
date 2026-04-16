@@ -431,7 +431,7 @@ def main():
     parser = argparse.ArgumentParser(
         description="Place pizza orders on skalborgpizza.dk"
     )
-    parser.add_argument("--pizza-url", "-p", help="Pizza place URL (overrides .env)")
+    parser.add_argument("--pizza-url", "-p", default="https://skalborgpizza.dk/", help="Pizza place URL (default: https://skalborgpizza.dk/)")
     parser.add_argument("--sheet-url", "-s", help="Google Sheets URL (overrides .env)")
     parser.add_argument("--quiet", "-q", action="store_true", help="Suppress order summary output")
 
