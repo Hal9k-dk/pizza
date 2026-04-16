@@ -233,7 +233,7 @@ def main():
         help="Output format (default: print)",
     )
     parser.add_argument("--output", "-o", help="Output file path")
-    parser.add_argument("--url", help="Google Sheets URL (overrides .env)")
+    parser.add_argument("--url", "-u", help="Google Sheets URL (overrides .env)")
 
     args = parser.parse_args()
 

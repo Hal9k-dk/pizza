@@ -4,6 +4,7 @@ Automate placing pizza orders on skalborgpizza.dk based on the Google Spreadshee
 Opens a visible browser, fills in all items, then leaves it open for the user to complete checkout.
 """
 
+import argparse
 import os
 import re
 import sys
@@ -427,23 +428,33 @@ def place_orders(orders: list[dict], pizza_url: str) -> None:
 # ---------------------------------------------------------------------------
 
 def main():
+    parser = argparse.ArgumentParser(
+        description="Place pizza orders on skalborgpizza.dk"
+    )
+    parser.add_argument("--pizza-url", "-p", help="Pizza place URL (overrides .env)")
+    parser.add_argument("--sheet-url", "-s", help="Google Sheets URL (overrides .env)")
+    parser.add_argument("--quiet", "-q", action="store_true", help="Suppress order summary output")
+
+    args = parser.parse_args()
+
     load_dotenv()
-    pizza_url = os.getenv("PIZZA_PLACE")
+    pizza_url = args.pizza_url or os.getenv("PIZZA_PLACE")
     if not pizza_url:
-        print("✗ PIZZA_PLACE not set in .env")
+        print("✗ PIZZA_PLACE not set in .env and --pizza-url not provided")
         sys.exit(1)
 
     print("Fetching orders from Google Spreadsheet…")
-    orders = extract_orders(output_format=None)  # silent, returns list
+    orders = extract_orders(url=args.sheet_url, output_format=None)  # silent, returns list
     if not orders:
         print("No orders found.")
         sys.exit(1)
 
-    print(f"Found {len(orders)} orders:\n")
-    for o in orders:
-        mods = f"  [{o['Tilbehør']}]" if o.get("Tilbehør") else ""
-        print(f"  {o['Navn']}: {o['Nr']}{mods}")
-    print()
+    if not args.quiet:
+        print(f"Found {len(orders)} orders:\n")
+        for o in orders:
+            mods = f"  [{o['Tilbehør']}]" if o.get("Tilbehør") else ""
+            print(f"  {o['Navn']}: {o['Nr']}{mods}")
+        print()
 
     place_orders(orders, pizza_url)
 
