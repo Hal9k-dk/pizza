@@ -8,6 +8,7 @@ import argparse
 import os
 import re
 import sys
+import time
 from urllib.parse import urlsplit, urlunsplit
 
 from dotenv import load_dotenv
@@ -249,7 +250,13 @@ def wait_for_menu_ready(page: Page) -> None:
         """
         () => {
             const items = document.querySelectorAll("li[onclick*='showItemDetails']");
-            return items.length > 0 && typeof window.showItemDetails === 'function';
+            const controls = Array.from(document.querySelectorAll('a, button, span, div, input[type=button], input[type=submit]'));
+            const pickupSelected = controls.some(el => /afhentning/i.test((el.innerText || el.value || '').trim())
+                && /orderTypeBtnSelected|delpick|cartdelpick/.test(el.className || ''));
+            const pickupAvailable = controls.some(el => /afhentning/i.test((el.innerText || el.value || '').trim()));
+            return items.length > 0
+                && typeof window.showItemDetails === 'function'
+                && (pickupSelected || pickupAvailable);
         }
         """,
         timeout=20000,
@@ -257,16 +264,272 @@ def wait_for_menu_ready(page: Page) -> None:
 
 
 def choose_pickup(page: Page) -> None:
-    """Choose Afhentning in the order-type popup."""
+    """Ensure Afhentning is selected in the order-type UI."""
+    already_pickup = page.evaluate(
+        """
+        () => Array.from(document.querySelectorAll('a, button, span, div'))
+            .some(el => /afhentning/i.test((el.innerText || '').trim())
+                && /orderTypeBtnSelected|delpick|cartdelpick/.test(el.className || ''))
+        """
+    )
+    if already_pickup:
+        print("✓ 'Afhentning' already selected")
+        return
+
     pickup_popup_button = "#colorbox input[value='Afhentning']"
-    pickup_page_link = "a[onclick='changemenucard(2);']"
+    pickup_page_link_candidates = [
+        "a[onclick='changemenucard(2);']",
+        "a:has-text('Afhentning')",
+        "button:has-text('Afhentning')",
+        "input[type=button][value='Afhentning']",
+        "input[type=submit][value='Afhentning']",
+    ]
 
     if page.locator(pickup_popup_button).count():
         page.click(pickup_popup_button, timeout=5000)
     else:
-        page.click(pickup_page_link, timeout=5000)
+        clicked = False
+        for selector in pickup_page_link_candidates:
+            try:
+                locator = page.locator(selector).first
+                if locator.count() and locator.is_visible(timeout=1000):
+                    locator.click(timeout=5000)
+                    clicked = True
+                    break
+            except Exception:
+                continue
+        if not clicked:
+            raise RuntimeError("Could not find an Afhentning control on the menu page")
 
-    page.wait_for_selector("#cboxOverlay", state="hidden", timeout=15000)
+    try:
+        page.wait_for_selector("#cboxOverlay", state="hidden", timeout=15000)
+    except Exception:
+        pass
+
+
+def debug_cookie_controls(page: Page) -> None:
+    """Print visible cookie-related controls so we can debug the exact banner behavior."""
+    frames = [page.main_frame] + list(page.frames)
+    seen = set()
+
+    for frame in frames:
+        try:
+            controls = frame.evaluate(
+                """
+                () => {
+                    const nodes = Array.from(document.querySelectorAll('button, a, input[type=button], input[type=submit]'));
+                    return nodes
+                        .map((el, idx) => {
+                            const text = (el.innerText || el.value || '').trim();
+                            const attrs = [
+                                el.id ? `#${el.id}` : '',
+                                el.className ? `.${String(el.className).trim().replace(/\\s+/g, '.')}` : '',
+                                el.getAttribute('aria-label') || '',
+                                el.getAttribute('title') || '',
+                            ].filter(Boolean).join(' ');
+                            const visible = !!(el.offsetWidth || el.offsetHeight || el.getClientRects().length);
+                            return { idx, text, attrs, visible };
+                        })
+                        .filter(x => x.visible)
+                        .filter(x => {
+                            const hay = `${x.text} ${x.attrs}`.toLowerCase();
+                            return hay.includes('cookie')
+                                || hay.includes('accept')
+                                || hay.includes('accepter')
+                                || hay.includes('tillad')
+                                || hay.includes('consent')
+                                || hay.includes('privacy')
+                                || hay.includes('indstillinger')
+                                || hay.includes('settings');
+                        })
+                        .slice(0, 20);
+                }
+                """
+            )
+        except Exception:
+            continue
+
+        for control in controls:
+            key = (frame.url, control["text"], control["attrs"])
+            if key in seen:
+                continue
+            seen.add(key)
+            frame_name = "main-frame" if frame == page.main_frame else f"frame:{frame.url}"
+            print(
+                f"COOKIE DEBUG [{frame_name}] text={control['text']!r} attrs={control['attrs']!r}"
+            )
+
+
+def dismiss_cookie_banner(page: Page) -> bool:
+    """Dismiss only explicit accept-all cookie banners; avoid broad clicks that open settings."""
+    selectors = [
+        "#CybotCookiebotDialogBodyLevelButtonLevelOptinAllowAll",
+        "#CybotCookiebotDialogBodyButtonAccept",
+        "button#onetrust-accept-btn-handler",
+        "button:has-text('Jeg accepterer')",
+        "button:has-text('Accepter alle')",
+        "button:has-text('Accept all')",
+        "button:has-text('Tillad alle')",
+        "input[type=button][value='Jeg accepterer']",
+        "input[type=button][value='Accepter alle']",
+        "input[type=button][value='Accept all']",
+        "input[type=button][value='Tillad alle']",
+    ]
+
+    debug_cookie_controls(page)
+
+    frames = [page.main_frame] + list(page.frames)
+    for frame in frames:
+        for selector in selectors:
+            try:
+                locator = frame.locator(selector).first
+                if locator.count() and locator.is_visible(timeout=1000):
+                    label = (locator.inner_text(timeout=1000) or "").strip() if 'input[' not in selector else selector
+                    frame_name = "main-frame" if frame == page.main_frame else frame.url
+                    print(f"COOKIE DEBUG clicking {selector!r} on {frame_name}: {label!r}")
+                    locator.click(timeout=3000)
+                    time.sleep(1)
+                    return True
+            except Exception:
+                continue
+
+    return False
+
+
+def dismiss_cookie_banners(page: Page, attempts: int = 2) -> int:
+    """Dismiss cookie banners a couple of times in case the site shows a second real consent layer."""
+    dismissed = 0
+    for _ in range(attempts):
+        if page.is_closed():
+            break
+        if not dismiss_cookie_banner(page):
+            break
+        dismissed += 1
+        try:
+            page.wait_for_load_state("domcontentloaded", timeout=3000)
+        except Exception:
+            pass
+        time.sleep(1)
+    return dismissed
+
+
+def wait_for_real_site(page: Page, timeout_ms: int = 120000) -> bool:
+    """
+    Wait through the anti-bot/front-page interstitial until the actual site loads.
+
+    Returns True once the interstitial is gone, False if it never clears within
+    the timeout.
+    """
+    deadline = time.monotonic() + (timeout_ms / 1000)
+    while time.monotonic() < deadline:
+        if page.is_closed():
+            raise RuntimeError("Browser page was closed while waiting for the site to load")
+
+        try:
+            body_text = (page.locator("body").inner_text(timeout=3000) or "").strip()
+        except Exception:
+            time.sleep(1)
+            continue
+
+        interstitial = (
+            "Please wait while your request is being verified" in body_text
+            or "One moment, please" in body_text
+        )
+        if not interstitial:
+            try:
+                page.wait_for_load_state("domcontentloaded", timeout=5000)
+            except Exception:
+                pass
+            time.sleep(1.5)
+            return True
+
+        time.sleep(1)
+
+    return False
+
+
+def prompt_manual_site_ready(page: Page) -> None:
+    """Let the user manually clear the verification/front page in the visible browser."""
+    print()
+    print("⚠ The site is still showing its verification/front page.")
+    print("  Please use the opened browser window to complete any manual step needed")
+    print("  until the real menu page is visible, then press Enter here to continue.")
+    print("  If needed, navigate the browser to the menu page manually.")
+    input()
+    if page.is_closed():
+        raise RuntimeError("Browser page was closed before the real menu page became available")
+
+
+def open_working_menu_page(page: Page, pizza_url: str) -> None:
+    """
+    Open the pizza site robustly.
+
+    The configured URL may land on a front page/interstitial first, and the real
+    ordering UI may only become available after a delay/reload or after manually
+    navigating to /menukort.
+    """
+    menu_url = normalize_menu_url(pizza_url)
+    candidates = []
+    for url in [pizza_url.strip(), menu_url]:
+        if url and url not in candidates:
+            candidates.append(url)
+
+    def menu_ready() -> bool:
+        if page.is_closed():
+            return False
+        try:
+            return page.evaluate(
+                """
+                () => {
+                    const items = document.querySelectorAll("li[onclick*='showItemDetails']");
+                    const controls = Array.from(document.querySelectorAll('a, button, span, div, input[type=button], input[type=submit]'));
+                    const pickupSelected = controls.some(el => /afhentning/i.test((el.innerText || el.value || '').trim())
+                        && /orderTypeBtnSelected|delpick|cartdelpick/.test(el.className || ''));
+                    const pickupAvailable = controls.some(el => /afhentning/i.test((el.innerText || el.value || '').trim()));
+                    return items.length > 0
+                        && typeof window.showItemDetails === 'function'
+                        && (pickupSelected || pickupAvailable);
+                }
+                """
+            )
+        except Exception:
+            return False
+
+    for url in candidates:
+        page.goto(url, wait_until="domcontentloaded", timeout=60000)
+        dismiss_cookie_banners(page)
+        if not wait_for_real_site(page):
+            prompt_manual_site_ready(page)
+        dismiss_cookie_banners(page)
+
+        for _ in range(3):
+            try:
+                page.wait_for_load_state("networkidle", timeout=10000)
+            except Exception:
+                pass
+
+            dismiss_cookie_banners(page)
+
+            if menu_ready():
+                return
+
+            if "/menukort" not in page.url.rstrip("/"):
+                page.goto(menu_url, wait_until="domcontentloaded", timeout=60000)
+                dismiss_cookie_banners(page)
+                if not wait_for_real_site(page, timeout_ms=30000):
+                    prompt_manual_site_ready(page)
+                dismiss_cookie_banners(page)
+            else:
+                time.sleep(2)
+                dismiss_cookie_banners(page)
+
+            if menu_ready():
+                return
+
+    raise RuntimeError(
+        "Configured pizza URL did not open the expected menu page. "
+        f"Opened: {page.url}"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -274,37 +537,45 @@ def choose_pickup(page: Page) -> None:
 # ---------------------------------------------------------------------------
 
 def place_orders(orders: list[dict], pizza_url: str) -> None:
-    menu_url = normalize_menu_url(pizza_url)
-
     with sync_playwright() as p:
-        browser = p.chromium.launch(headless=False)
-        page = browser.new_page()
-        page.goto(menu_url, wait_until="domcontentloaded")
-        page.wait_for_load_state("networkidle")
-
-        # Fail fast with a useful message if the configured URL does not land on
-        # the legacy menu page that exposes changemenucard()/showItemDetails().
-        pickup_selector = (
-            "#colorbox input[value='Afhentning'], "
-            "a[onclick='changemenucard(2);']"
+        browser = p.chromium.launch(
+            headless=False,
+            args=[
+                "--disable-blink-features=AutomationControlled",
+            ],
         )
-        if not page.locator(pickup_selector).count():
-            raise RuntimeError(
-                "Configured pizza URL did not open the expected menu page. "
-                f"Opened: {page.url}"
-            )
+        context = browser.new_context(
+            viewport={"width": 1440, "height": 960},
+            user_agent=(
+                "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+                "(KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36"
+            ),
+            locale="da-DK",
+        )
+        page = context.new_page()
+        page.add_init_script(
+            """
+            Object.defineProperty(navigator, 'webdriver', {
+                get: () => undefined,
+            });
+            """
+        )
+        open_working_menu_page(page, pizza_url)
 
-        # 1. Dismiss TermsFeed cookie consent
-        try:
-            page.click("button:has-text('Jeg accepterer')", timeout=5000)
-            page.wait_for_timeout(600)
-        except Exception:
-            pass
+        # 1. Dismiss cookie consent if present
+        cookie_dismissals = dismiss_cookie_banners(page)
+        if cookie_dismissals:
+            print(f"✓ Dismissed cookie banner {cookie_dismissals} time(s)")
 
         wait_for_menu_ready(page)
 
         # 2. Dismiss the "Udbringning eller hent selv?" chooser — choose Afhentning
         choose_pickup(page)
+        cookie_dismissals = dismiss_cookie_banners(page)
+        if cookie_dismissals:
+            print(f"✓ Dismissed cookie banner {cookie_dismissals} time(s) after pickup selection")
+        else:
+            print("COOKIE DEBUG no explicit accept-all cookie button found after pickup selection")
         wait_for_menu_ready(page)
         print("✓ Selected 'Afhentning' (pickup)\n")
 
@@ -419,7 +690,11 @@ def place_orders(orders: list[dict], pizza_url: str) -> None:
         print("  The browser is open — complete and submit the order.")
         print("  Press Enter here when done to close the browser.")
         print("=" * 60)
-        input()
+        try:
+            input()
+        except EOFError:
+            print("No interactive stdin available; closing browser.")
+        context.close()
         browser.close()
 
 
