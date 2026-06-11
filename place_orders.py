@@ -264,18 +264,45 @@ def wait_for_menu_ready(page: Page) -> None:
 
 
 def choose_pickup(page: Page) -> None:
-    """Ensure Afhentning is selected in the order-type UI."""
-    already_pickup = page.evaluate(
+    """Ensure Afhentning is selected and the delivery/pickup colorbox is dismissed."""
+    # Check whether the delivery/pickup colorbox is still open — this is the
+    # modal that asks "Udbringning eller hent selv?".  If it's still visible
+    # with the Afhentning button inside it, we MUST click that button to
+    # actually select pickup and close the colorbox.  The old "already_pickup"
+    # check matched the button text *inside* the still-open dialog, causing a
+    # false positive that left the overlay blocking all menu interaction.
+    colorbox_visible = page.evaluate(
         """
-        () => Array.from(document.querySelectorAll('a, button, span, div'))
-            .some(el => /afhentning/i.test((el.innerText || '').trim())
-                && /orderTypeBtnSelected|delpick|cartdelpick/.test(el.className || ''))
+        () => {
+            const overlay = document.querySelector('#cboxOverlay');
+            const colorbox = document.querySelector('#colorbox');
+            return {
+                overlay_display: overlay ? window.getComputedStyle(overlay).display : 'missing',
+                colorbox_display: colorbox ? window.getComputedStyle(colorbox).display : 'missing',
+            };
+        }
         """
     )
-    if already_pickup:
-        print("✓ 'Afhentning' already selected")
-        return
+    dialog_is_open = (
+        colorbox_visible.get("overlay_display") != "none"
+        and colorbox_visible.get("colorbox_display") != "none"
+    )
 
+    if not dialog_is_open:
+        # Colorbox is already closed — check if Afhentning is selected on the page
+        already_pickup = page.evaluate(
+            """
+            () => Array.from(document.querySelectorAll('a, button, span, div'))
+                .some(el => /afhentning/i.test((el.innerText || '').trim())
+                    && /orderTypeBtnSelected|delpick|cartdelpick/.test(el.className || ''))
+            """
+        )
+        if already_pickup:
+            print("✓ 'Afhentning' already selected")
+            return
+
+    # Colorbox with the delivery/pickup dialog is still open (or Afhentning
+    # wasn't selected yet) — click the Afhentning button inside it.
     pickup_popup_button = "#colorbox input[value='Afhentning']"
     pickup_page_link_candidates = [
         "a[onclick='changemenucard(2);']",
@@ -301,10 +328,21 @@ def choose_pickup(page: Page) -> None:
         if not clicked:
             raise RuntimeError("Could not find an Afhentning control on the menu page")
 
+    # With $.fx.off=true the colorbox should close instantly, but if the
+    # overlay still lingers (e.g. the site JS closed the content but not the
+    # overlay), forcibly remove it so it doesn't block further interactions.
     try:
-        page.wait_for_selector("#cboxOverlay", state="hidden", timeout=15000)
+        page.wait_for_selector("#cboxOverlay", state="hidden", timeout=8000)
     except Exception:
-        pass
+        print("    ⚠ overlay still visible after pickup selection — forcibly removing it")
+        page.evaluate("""
+            () => {
+                const overlay = document.querySelector('#cboxOverlay');
+                if (overlay) overlay.style.display = 'none';
+                const colorbox = document.querySelector('#colorbox');
+                if (colorbox) colorbox.style.display = 'none';
+            }
+        """)
 
 
 def debug_cookie_controls(page: Page) -> None:
@@ -539,7 +577,7 @@ def open_working_menu_page(page: Page, pizza_url: str) -> None:
 def place_orders(orders: list[dict], pizza_url: str) -> None:
     with sync_playwright() as p:
         browser = p.chromium.launch(
-            headless=False,
+            headless=True,
             args=[
                 "--disable-blink-features=AutomationControlled",
             ],
@@ -569,6 +607,12 @@ def place_orders(orders: list[dict], pizza_url: str) -> None:
 
         wait_for_menu_ready(page)
 
+        # 1.5. Kill jQuery animations early — this makes the colorbox close
+        # animation instant when we click "Afhentning" below.  We must also
+        # re-apply this AFTER choose_pickup because clicking Afhentning resets
+        # the page's JavaScript context (losing $.fx.off and our overrides).
+        page.evaluate("$.fx.off = true;")
+
         # 2. Dismiss the "Udbringning eller hent selv?" chooser — choose Afhentning
         choose_pickup(page)
         cookie_dismissals = dismiss_cookie_banners(page)
@@ -579,26 +623,11 @@ def place_orders(orders: list[dict], pizza_url: str) -> None:
         wait_for_menu_ready(page)
         print("✓ Selected 'Afhentning' (pickup)\n")
 
-        # 3. Scrape the menu
-        menu = scrape_menu(page)
-        print(f"✓ Menu scraped: {len(menu)} entries\n")
-
-        # 4. Kill animations so each order processes ~800 ms faster
+        # Re-apply $.fx.off and showItemToppings override — the choose_pickup
+        # click resets the page's JavaScript context, so we must re-install.
         page.evaluate("""
             () => {
-                // Disable all jQuery duration-based animations ($.animate, $.fadeTo, etc.)
-                // Callbacks still fire — they just fire instantly.
                 $.fx.off = true;
-
-                // Replace showItemToppings to:
-                //  a) remove the 200 ms setTimeout so load_toppings AJAX fires immediately
-                //  b) avoid .promise().done() which fires the callback TWICE in jQuery 1.8
-                //     when $.fx.off=true (a known jQuery 1.8 bug), causing two AJAX calls
-                //  c) abort any in-flight toppings request before starting a new one, so
-                //     the inline <script> in show_item_details.php and our select_option()
-                //     onchange can never race each other
-                //  d) set window._toppingsDone=true when the AJAX completes, so Python can
-                //     reliably wait for toppings to load even on items with no checkboxes
                 window._toppingXHR = null;
                 window._toppingsDone = false;
                 window.showItemToppings = function(proId, childProductId) {
@@ -622,10 +651,17 @@ def place_orders(orders: list[dict], pizza_url: str) -> None:
                             colorboxResize(true);
                             calculateRuntimePrice();
                         }
-                    );
+                    ).fail(function() {
+                        window._toppingXHR = null;
+                        window._toppingsDone = true;
+                    });
                 };
             }
         """)
+
+        # 3. Scrape the menu
+        menu = scrape_menu(page)
+        print(f"✓ Menu scraped: {len(menu)} entries\n")
 
         # 5. Process each order
         for idx, order in enumerate(orders, 1):
@@ -657,33 +693,50 @@ def place_orders(orders: list[dict], pizza_url: str) -> None:
             select_prefix = nr_variant if nr_variant else entry["select_prefix"]
 
             # --- Open item detail modal ------------------------------------
-            # Clear #product_id first so wait_for_function below cannot resolve
-            # with stale content left over from the previous modal (same item_id
-            # would otherwise match immediately before show_item_details.php responds).
-            page.evaluate(
-                """
-                () => {
-                    const el = document.querySelector('#product_id');
-                    if (el) el.value = '';
-                }
-                """
-            )
-            page.click(f"li[onclick='showItemDetails({item_id})']")
-            # Now wait for show_item_details.php to respond and populate fresh content.
-            page.wait_for_function(
-                f"() => document.querySelector('#product_id')?.value === '{item_id}'",
-                timeout=10000
-            )
+            item_start = time.monotonic()
+            try:
+                # Clear #product_id first so wait_for_function below cannot resolve
+                # with stale content left over from the previous modal (same item_id
+                # would otherwise match immediately before show_item_details.php responds).
+                page.evaluate(
+                    """
+                    () => {
+                        const el = document.querySelector('#product_id');
+                        if (el) el.value = '';
+                    }
+                    """
+                )
+                page.click(f"li[onclick='showItemDetails({item_id})']", timeout=5000)
+                # Now wait for show_item_details.php to respond and populate fresh content.
+                page.wait_for_function(
+                    f"() => document.querySelector('#product_id')?.value === '{item_id}'",
+                    timeout=10000
+                )
 
-            # --- Select variant (size) ------------------------------------
-            select_variant(page, select_prefix)
+                # --- Select variant (size) ------------------------------------
+                select_variant(page, select_prefix)
 
-            # --- Tick modification checkboxes ----------------------------
-            apply_modifications(page, mods)
+                # --- Tick modification checkboxes ----------------------------
+                apply_modifications(page, mods)
 
-            # --- Add to cart ---------------------------------------------
-            add_to_cart(page)
-            print("    ✓ Added to cart\n")
+                # --- Add to cart ---------------------------------------------
+                add_to_cart(page)
+                elapsed = time.monotonic() - item_start
+                print(f"    ✓ Added to cart ({elapsed:.1f}s)\n")
+            except Exception as e:
+                elapsed = time.monotonic() - item_start
+                print(f"    ✗ FAILED after {elapsed:.1f}s: {e}")
+                # Force-close any open colorbox overlay so subsequent items can proceed
+                page.evaluate("""
+                    () => {
+                        try { if (typeof $ !== 'undefined' && $.colorbox) $.colorbox.close(); } catch(e) {}
+                        const el = document.querySelector('#cboxOverlay');
+                        if (el) el.style.display = 'none';
+                        const cb = document.querySelector('#colorbox');
+                        if (cb) cb.style.display = 'none';
+                    }
+                """)
+                continue
 
         print("=" * 60)
         print(f"✓ All {len(orders)} orders added to cart.")
