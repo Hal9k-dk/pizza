@@ -75,6 +75,26 @@ The configured `PIZZA_PLACE` may be either the site root (for example
 `https://skalborgpizza.dk`) or the direct menu URL. The script normalizes it to
 `/menukort` automatically.
 
+### Optional login
+
+If you want the script to log in before placing orders, set these in `.env`:
+
+```
+PIZZA_EMAIL=your@email.dk
+PIZZA_PASSWORD=yourpassword
+```
+
+Or pass them on the command line:
+
+```bash
+place-orders --email your@email.dk --password yourpassword
+```
+
+When both email and password are provided, the script logs in on
+`/login-opret` before navigating to the menu. If neither is provided
+(or only one is), login is skipped entirely and the script works as
+it always has.
+
 ## Spreadsheet format
 
 The script expects a sheet with a header row containing at least these columns:

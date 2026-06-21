@@ -17,6 +17,50 @@ from playwright.sync_api import Page, sync_playwright
 from extract_orders import extract_orders
 
 # ---------------------------------------------------------------------------
+# Login
+# ---------------------------------------------------------------------------
+
+
+def login(page: Page, email: str, password: str) -> None:
+    """Log in to the pizza site with the given credentials.
+
+    Navigates to the login page, fills in the email and password fields,
+    submits the form, and waits until the navigation back to the main site
+    (indicating a successful login).
+    """
+    print("Logging in…")
+    page.goto("https://www.skalborgpizza.dk/login-opret", wait_until="domcontentloaded", timeout=30000)
+    dismiss_cookie_banners(page)
+    page.wait_for_selector("#username", timeout=10000)
+
+    page.fill("#username", email)
+    page.fill("#password", password)
+    page.click("input.btn_login[value='LOGIND']")
+
+    # Wait for the login form to disappear — successful login redirects away
+    # from /login-opret to the main page (or /menukort).
+    try:
+        page.wait_for_function(
+            "() => !window.location.pathname.includes('/login-opret')",
+            timeout=15000,
+        )
+    except Exception as e:
+        # Check for error messages on the login page
+        error_el = page.query_selector("span.msghide")
+        if error_el:
+            error_text = error_el.inner_text().strip()
+            if error_text:
+                print(f"    ✗ Login failed: {error_text}")
+            else:
+                print("    ✗ Login failed (unknown reason)")
+        else:
+            print(f"    ✗ Login failed or timed out: {e}")
+        raise RuntimeError("Login failed") from e
+
+    print("✓ Logged in successfully\n")
+
+
+# ---------------------------------------------------------------------------
 # URL helpers
 # ---------------------------------------------------------------------------
 
@@ -405,6 +449,7 @@ def dismiss_cookie_banner(page: Page) -> bool:
         "#CybotCookiebotDialogBodyButtonAccept",
         "button#onetrust-accept-btn-handler",
         "button:has-text('Jeg accepterer')",
+        "button.cc-nb-okagree",
         "button:has-text('Accepter alle')",
         "button:has-text('Accept all')",
         "button:has-text('Tillad alle')",
@@ -574,10 +619,11 @@ def open_working_menu_page(page: Page, pizza_url: str) -> None:
 # Main ordering flow
 # ---------------------------------------------------------------------------
 
-def place_orders(orders: list[dict], pizza_url: str) -> None:
+def place_orders(orders: list[dict], pizza_url: str,
+                 email: str | None = None, password: str | None = None) -> None:
     with sync_playwright() as p:
         browser = p.chromium.launch(
-            headless=True,
+            headless=False,
             args=[
                 "--disable-blink-features=AutomationControlled",
             ],
@@ -598,6 +644,11 @@ def place_orders(orders: list[dict], pizza_url: str) -> None:
             });
             """
         )
+
+        # Login first if credentials are provided
+        if email and password:
+            login(page, email, password)
+
         open_working_menu_page(page, pizza_url)
 
         # 1. Dismiss cookie consent if present
@@ -761,6 +812,8 @@ def main():
     )
     parser.add_argument("--pizza-url", "-p", default="https://skalborgpizza.dk/", help="Pizza place URL (default: https://skalborgpizza.dk/)")
     parser.add_argument("--sheet-url", "-s", help="Google Sheets URL (overrides .env)")
+    parser.add_argument("--email", "-e", help="Login email (overrides PIZZA_EMAIL in .env)")
+    parser.add_argument("--password", help="Login password (overrides PIZZA_PASSWORD in .env)")
     parser.add_argument("--quiet", "-q", action="store_true", help="Suppress order summary output")
 
     args = parser.parse_args()
@@ -770,6 +823,9 @@ def main():
     if not pizza_url:
         print("✗ PIZZA_PLACE not set in .env and --pizza-url not provided")
         sys.exit(1)
+
+    email = args.email or os.getenv("PIZZA_EMAIL")
+    password = args.password or os.getenv("PIZZA_PASSWORD")
 
     print("Fetching orders from Google Spreadsheet…")
     orders = extract_orders(url=args.sheet_url, output_format=None)  # silent, returns list
@@ -784,7 +840,7 @@ def main():
             print(f"  {o['Navn']}: {o['Nr']}{mods}")
         print()
 
-    place_orders(orders, pizza_url)
+    place_orders(orders, pizza_url, email=email, password=password)
 
 
 if __name__ == "__main__":
