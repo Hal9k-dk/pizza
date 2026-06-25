@@ -11,7 +11,7 @@ import sys
 import time
 from urllib.parse import urlsplit, urlunsplit
 
-from dotenv import load_dotenv
+from dotenv import load_dotenv, find_dotenv
 from playwright.sync_api import Page, sync_playwright
 
 from extract_orders import extract_orders
@@ -818,7 +818,7 @@ def main():
 
     args = parser.parse_args()
 
-    load_dotenv()
+    load_dotenv(find_dotenv(usecwd=True))
     pizza_url = args.pizza_url or os.getenv("PIZZA_PLACE")
     if not pizza_url:
         print("✗ PIZZA_PLACE not set in .env and --pizza-url not provided")

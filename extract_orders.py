@@ -12,7 +12,7 @@ import sys
 from datetime import datetime
 from io import StringIO
 
-from dotenv import load_dotenv
+from dotenv import load_dotenv, find_dotenv
 
 try:
     import requests
@@ -32,7 +32,7 @@ SPECIAL_ROWS = {
 
 def get_spreadsheet_url():
     """Load Google Spreadsheet URL from .env file."""
-    load_dotenv()
+    load_dotenv(find_dotenv(usecwd=True))
     url = os.getenv("ORDER_SHEET_URL")
     if not url:
         raise ValueError("ORDER_SHEET_URL not found in .env file")
