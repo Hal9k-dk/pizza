@@ -438,6 +438,26 @@ def add_to_cart(page: Page) -> None:
     page.wait_for_selector("#cboxOverlay", state="hidden", timeout=10000)
 
 
+def _pickup_selected_js() -> str:
+    """Return JS that checks whether the 'Afhentning' order type is selected.
+
+    Must match the *button* itself (exact text "Afhentning" and the
+    ``orderTypeBtnSelected`` class), not the cart/delivery containers that
+    merely list both "Udbringning" and "Afhentning".
+    """
+    return """
+        () => Array.from(document.querySelectorAll('a, button, span, div, input, select'))
+            .some(el => (el.innerText || el.value || '').trim() === 'Afhentning'
+                && el.classList
+                && el.classList.contains('orderTypeBtnSelected'))
+    """
+
+
+def is_pickup_selected(page: Page) -> bool:
+    """Whether the current page has 'Afhentning' selected."""
+    return bool(page.evaluate(_pickup_selected_js()))
+
+
 def wait_for_menu_ready(page: Page) -> None:
     """Wait until the actual menu page is interactive."""
     page.wait_for_function(
@@ -445,9 +465,9 @@ def wait_for_menu_ready(page: Page) -> None:
         () => {
             const items = document.querySelectorAll("li[onclick*='showItemDetails']");
             const controls = Array.from(document.querySelectorAll('a, button, span, div, input[type=button], input[type=submit]'));
-            const pickupSelected = controls.some(el => /afhentning/i.test((el.innerText || el.value || '').trim())
-                && /orderTypeBtnSelected|delpick|cartdelpick/.test(el.className || ''));
-            const pickupAvailable = controls.some(el => /afhentning/i.test((el.innerText || el.value || '').trim()));
+            const pickupSelected = controls.some(el => (el.innerText || el.value || '').trim() === 'Afhentning'
+                && el.classList && el.classList.contains('orderTypeBtnSelected'));
+            const pickupAvailable = controls.some(el => (el.innerText || el.value || '').trim() === 'Afhentning');
             return items.length > 0
                 && typeof window.showItemDetails === 'function'
                 && (pickupSelected || pickupAvailable);
@@ -484,14 +504,7 @@ def choose_pickup(page: Page) -> None:
 
     if not dialog_is_open:
         # Colorbox is already closed — check if Afhentning is selected on the page
-        already_pickup = page.evaluate(
-            """
-            () => Array.from(document.querySelectorAll('a, button, span, div'))
-                .some(el => /afhentning/i.test((el.innerText || '').trim())
-                    && /orderTypeBtnSelected|delpick|cartdelpick/.test(el.className || ''))
-            """
-        )
-        if already_pickup:
+        if is_pickup_selected(page):
             print("✓ 'Afhentning' already selected")
             return
 
@@ -537,6 +550,16 @@ def choose_pickup(page: Page) -> None:
                 if (colorbox) colorbox.style.display = 'none';
             }
         """)
+
+    # Verify Afhentning actually became selected.  changemenucard() reloads
+    # the page after setting the order type, so this waits for the new page
+    # state to settle before confirming.
+    try:
+        page.wait_for_function(_pickup_selected_js(), timeout=15000)
+    except Exception as e:
+        raise RuntimeError(
+            "Clicked 'Afhentning' but it did not become selected"
+        ) from e
 
 
 def debug_cookie_controls(page: Page) -> None:
@@ -716,9 +739,9 @@ def open_working_menu_page(page: Page, pizza_url: str) -> None:
                 () => {
                     const items = document.querySelectorAll("li[onclick*='showItemDetails']");
                     const controls = Array.from(document.querySelectorAll('a, button, span, div, input[type=button], input[type=submit]'));
-                    const pickupSelected = controls.some(el => /afhentning/i.test((el.innerText || el.value || '').trim())
-                        && /orderTypeBtnSelected|delpick|cartdelpick/.test(el.className || ''));
-                    const pickupAvailable = controls.some(el => /afhentning/i.test((el.innerText || el.value || '').trim()));
+                    const pickupSelected = controls.some(el => (el.innerText || el.value || '').trim() === 'Afhentning'
+                        && el.classList && el.classList.contains('orderTypeBtnSelected'));
+                    const pickupAvailable = controls.some(el => (el.innerText || el.value || '').trim() === 'Afhentning');
                     return items.length > 0
                         && typeof window.showItemDetails === 'function'
                         && (pickupSelected || pickupAvailable);
