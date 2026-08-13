@@ -5,16 +5,145 @@ Opens a visible browser, fills in all items, then leaves it open for the user to
 """
 
 import argparse
+import csv
 import os
 import re
 import sys
 import time
+from io import StringIO
 from urllib.parse import urlsplit, urlunsplit
 
 from dotenv import load_dotenv, find_dotenv
 from playwright.sync_api import Page, sync_playwright
 
 from extract_orders import extract_orders
+
+try:
+    import requests
+except ImportError:
+    requests = None  # type: ignore[assignment]
+
+
+# ---------------------------------------------------------------------------
+# Spreadsheet Menu loader
+# ---------------------------------------------------------------------------
+
+
+def _normalize_name(name: str) -> str:
+    """Strip number prefix, punctuation, and whitespace for fuzzy matching."""
+    name = re.sub(r'^\d+[A-Za-z]?\.\s*', '', name)       # "71. Durum Kebab" → "Durum Kebab"
+    name = re.sub(r'\s*[-–]\s*Nyhed!?$', '', name, flags=re.IGNORECASE)  # drop " - Nyhed!"
+    name = re.sub(r'[()]', '', name)                      # "Chili Burger (Hot)" → "Chili Burger Hot"
+    name = re.sub(r'\s+', ' ', name).strip().lower()
+    return name
+
+
+def _discover_sheet_gid(sheet_url: str, sheet_name: str) -> str | None:
+    """Resolve a Google Sheets tab name to its gid.
+
+    The gid is not available via the public CSV export, but it is embedded in
+    the editor page's bootstrap JSON.  This parser looks for the
+    ``[n,0,"<gid>",[{"1":[[0,0,"<name>"]]`` sequence that Google Sheets emits
+    for each worksheet.
+
+    Returns ``None`` if the sheet cannot be found (e.g. the spreadsheet is
+    private or the tab was renamed).
+    """
+    if requests is None:
+        return None
+
+    sheet_id = sheet_url.split("/d/")[1].split("/")[0]
+    try:
+        resp = requests.get(
+            f"https://docs.google.com/spreadsheets/d/{sheet_id}/",
+            headers={"User-Agent": "Mozilla/5.0"},
+            timeout=15,
+        )
+        resp.raise_for_status()
+    except Exception:
+        return None
+
+    # The tab name and gid appear adjacent in the bootstrap data, with the
+    # JSON quotes backslash-escaped in the HTML source.
+    pattern = re.compile(
+        r'\[\d+,0,\\"(\d+)\\",\[\{\\"1\\":\[\[0,0,\\"' + re.escape(sheet_name) + r'\\"\]'
+    )
+    match = pattern.search(resp.text)
+    return match.group(1) if match else None
+
+
+def load_spreadsheet_menu(sheet_url: str | None = None) -> dict[str, dict]:
+    """Load the "Menu" sheet from the order spreadsheet.
+
+    Returns a dict keyed by the identifier used in the Bestilling sheet's
+    "Nr" column (just the number / code before the first `` - ``):
+
+        {
+          "86": {"name": "Kebab Sandwich", "fuldkorn_flag": False, "price": "70",
+                 "price_fuldkorn": "75"},
+          "71": {"name": "Durum Kebab",    "fuldkorn_flag": False, "price": "70"},
+          ...
+        }
+    """
+    if requests is None:
+        raise RuntimeError("The 'requests' package is required to load the spreadsheet menu.")
+
+    # Derive the spreadsheet ID from the ORDER_SHEET_URL.
+    if sheet_url is None:
+        load_dotenv(find_dotenv(usecwd=True))
+        sheet_url = os.getenv("ORDER_SHEET_URL", "")
+    sheet_id = sheet_url.split("/d/")[1].split("/")[0]
+
+    gid = os.getenv("MENU_SHEET_GID") or _discover_sheet_gid(sheet_url, "Menu")
+    if not gid:
+        raise RuntimeError(
+            "Could not determine the gid of the 'Menu' sheet. "
+            "Set MENU_SHEET_GID in .env or make sure the spreadsheet is public."
+        )
+
+    csv_url = (
+        f"https://docs.google.com/spreadsheets/d/{sheet_id}/export"
+        f"?format=csv&gid={gid}"
+    )
+
+    resp = requests.get(csv_url, timeout=15)
+    resp.raise_for_status()
+    csv_text = resp.content.decode("utf-8")
+
+    menu: dict[str, dict] = {}
+    reader = csv.reader(StringIO(csv_text))
+    rows = list(reader)
+
+    for row in rows:
+        if not row or len(row) < 5:
+            continue
+        nr = row[0].strip()
+        name = row[1].strip() if len(row) > 1 else ""
+        fuldkorn_raw = row[2].strip() if len(row) > 2 else ""
+        # Col D is the display name, col E is the price
+        price = row[4].strip() if len(row) > 4 else ""
+
+        if not nr or not name:
+            continue
+        # Skip the "0 / zero" placeholder row
+        if nr in ("0", "zero"):
+            continue
+        # Skip rows that look like variant lines (e.g. "129 (10 stk)")
+        if "(" in nr and nr[0].isdigit():
+            continue
+
+        fuldkorn_flag = fuldkorn_raw.upper() == "TRUE"
+        entry = {"name": name, "fuldkorn_flag": fuldkorn_flag, "price": price}
+
+        if nr not in menu:
+            # First entry for this key (always the non-Fuldkorn variant)
+            menu[nr] = entry
+        elif fuldkorn_flag and not menu[nr].get("fuldkorn_flag"):
+            # If the first entry wasn't Fuldkorn, store the Fuldkorn price
+            menu[nr]["price_fuldkorn"] = price
+
+    return menu
+
 
 # ---------------------------------------------------------------------------
 # Login
@@ -90,23 +219,30 @@ def normalize_menu_url(pizza_url: str) -> str:
 # ---------------------------------------------------------------------------
 
 
-def scrape_menu(page: Page) -> dict:
+def scrape_menu(page: Page) -> tuple[dict, dict, dict]:
     """
-    Build a lookup map from the menu page.
+    Build lookup maps from the website menu page.
 
-    Returns a dict keyed by the identifier used in the spreadsheet's "Nr" field:
-      - "9"        → numbered pizza  (e.g. "9 - Rose")
-      - "12A"      → alphanumeric    (e.g. "12A - Freyas Pizza")
-      - "Børnepizza 5" → named item  (e.g. "Børnepizza 5 - Børnepizza 5")
-      - "132"      → sub-variant     (e.g. "132 - Pommes Frites Stor")
+    Returns ``(menu, item_id_index, name_index)`` where:
+
+    * **menu** — keyed by the menu number / named-item identifier:
+      ``"9"``, ``"12A"``, ``"Børnepizza 5"``, ``"132"``
+    * **item_id_index** — keyed by the raw ``showItemDetails()`` argument
+      (e.g. ``"86"``).  Used as a fallback when a numeric key is not
+      found in *menu*.
+    * **name_index** — maps :func:`_normalize_name` → list of website
+      entries, for cross-referencing against the spreadsheet Menu sheet.
 
     Each value is a dict:
       {
         "item_id":        str,   # argument to showItemDetails()
-        "select_prefix":  str,   # text prefix to match in <select> (or None = first option)
+        "select_prefix":  str,   # text prefix to match in <select> (or None)
+        "name":           str,   # raw full_name from the website
       }
     """
     menu = {}
+    item_id_index = {}
+    name_index: dict[str, list[dict]] = {}
     items = page.query_selector_all("li[onclick*='showItemDetails']")
 
     for item in items:
@@ -122,15 +258,28 @@ def scrape_menu(page: Page) -> dict:
             continue
         full_name = names[-1]  # last .itemname is the actual pizza name
 
+        entry = {"item_id": item_id, "select_prefix": None, "name": full_name}
+
+        # Always index by the raw item_id as a fallback — this handles
+        # spreadsheets that use the internal item_id (e.g. "86") instead
+        # of the menu number (e.g. "76").  Kept in a separate dict to
+        # avoid collisions with menu numbers (e.g. item_id=4 is "Cocio"
+        # while menu number "4" is "Capricciosa").
+        item_id_index[item_id] = entry
+
         # --- numbered items: "3. Pepperoni", "12A. Freyas Pizza", …
-        nm = re.match(r'^(\d+[A-Z]?)\.\s+', full_name)
+        # Also match lowercase suffixes like "75a."
+        nm = re.match(r'^(\d+[A-Za-z]?)\.\s+', full_name)
         if nm:
             num = nm.group(1)
-            menu[num] = {"item_id": item_id, "select_prefix": None}
-            continue
+            menu[num] = entry
+        else:
+            # --- named items without a number prefix (Børnepizza X, Pommes Frites, …)
+            menu[full_name] = entry
 
-        # --- named items without a number prefix (Børnepizza X, Pommes Frites, …)
-        menu[full_name] = {"item_id": item_id, "select_prefix": None}
+        # --- name-based index for cross-referencing with the spreadsheet ---
+        norm = _normalize_name(full_name)
+        name_index.setdefault(norm, []).append(entry)
 
         # Check description for numbered variants like "Valg: 131. Lille, 132. Stor"
         desc_el = item.query_selector(".itemdescription")
@@ -141,9 +290,10 @@ def scrape_menu(page: Page) -> dict:
                 menu[variant_num] = {
                     "item_id": item_id,
                     "select_prefix": variant_num,  # match option text that starts with this
+                    "name": full_name,
                 }
 
-    return menu
+    return menu, item_id_index, name_index
 
 
 # ---------------------------------------------------------------------------
@@ -710,9 +860,19 @@ def place_orders(orders: list[dict], pizza_url: str,
             }
         """)
 
-        # 3. Scrape the menu
-        menu = scrape_menu(page)
-        print(f"✓ Menu scraped: {len(menu)} entries\n")
+        # 3. Load the spreadsheet Menu sheet (authoritative item list)
+        try:
+            ss_menu = load_spreadsheet_menu()
+            print(f"✓ Spreadsheet Menu loaded: {len(ss_menu)} items\n")
+        except Exception as e:
+            print(f"⚠ Could not load spreadsheet Menu: {e}")
+            ss_menu = {}
+
+        # 4. Scrape the website menu
+        menu, item_id_index, name_index = scrape_menu(page)
+        print(f"✓ Website menu scraped: {len(menu)} entries "
+              f"(+ {len(item_id_index)} by item_id, "
+              f"{len(name_index)} by name)\n")
 
         # 5. Process each order
         for idx, order in enumerate(orders, 1):
@@ -735,13 +895,59 @@ def place_orders(orders: list[dict], pizza_url: str,
             # A third segment (e.g. "Fuldkorn") overrides the menu's select_prefix
             nr_variant = nr_parts[2].strip() if len(nr_parts) > 2 else None
 
-            if key not in menu:
-                print(f"    ✗ Item {key!r} not found in menu — skipping\n")
+            entry = None
+
+            # Does the spreadsheet Menu know about this key?
+            ss_item = ss_menu.get(key)
+
+            if ss_item is not None:
+                # --- Spreadsheet-driven lookup: find the website item by
+                #     matching the canonical name from the Menu sheet ---
+                ss_name_norm = _normalize_name(ss_item["name"])
+                name_matches = name_index.get(ss_name_norm, [])
+                if len(name_matches) == 1:
+                    entry = name_matches[0]
+                elif len(name_matches) > 1:
+                    # Multiple matches — prefer the one whose menu number
+                    # matches the spreadsheet key.
+                    for candidate in name_matches:
+                        if menu.get(key) is candidate:
+                            entry = candidate
+                            break
+                    if entry is None:
+                        entry = name_matches[0]
+
+                # Fallback: if name matching didn't work, try direct menu
+                # lookup (handles variant numbers like "131" and spelling
+                # mismatches like "Nansy" vs "Nancy" on the website).
+                # Deliberately NOT using item_id_index here — that would
+                # create false positives (e.g. "86" → item_id=86 → "Stærk
+                # Durum" which is a different item than "Kebab Sandwich").
+                if entry is None:
+                    entry = menu.get(key)
+            else:
+                # --- Website-driven lookup (key not in spreadsheet Menu) ---
+                entry = menu.get(key)
+                if entry is None:
+                    # Fall back to raw website item_id (some spreadsheets
+                    # use the internal site ID instead of the menu number).
+                    entry = item_id_index.get(key)
+
+            if entry is None:
+                if ss_item is not None:
+                    print(f"    ✗ '{ss_item['name']}' (key {key!r}) "
+                          f"is in the spreadsheet Menu but NOT on the website — skipping\n")
+                else:
+                    print(f"    ✗ Item {key!r} not found in menu — skipping\n")
                 continue
 
-            entry         = menu[key]
             item_id       = entry["item_id"]
-            select_prefix = nr_variant if nr_variant else entry["select_prefix"]
+            select_prefix = nr_variant
+            if select_prefix is None and ss_item is not None:
+                if ss_item.get("fuldkorn_flag"):
+                    select_prefix = "Fuldkorn"
+            if select_prefix is None:
+                select_prefix = entry["select_prefix"]
 
             # --- Open item detail modal ------------------------------------
             item_start = time.monotonic()
