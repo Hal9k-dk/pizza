@@ -29,6 +29,23 @@ except ImportError:
 # ---------------------------------------------------------------------------
 
 
+_MENU_KEY_RE = re.compile(r'^(\d+)([A-Za-z]?)$')
+
+
+def normalize_menu_key(key: str) -> str:
+    """Canonicalise a menu number so lookups are case-insensitive.
+
+    The website mixes cases for suffix letters (it lists ``"75a. Durum Kebab
+    Kylling & Bacon"`` while the spreadsheet says ``75A``), so compare
+    ``"75a"`` and ``"75A"`` as the same key.
+    """
+    key = key.strip()
+    m = _MENU_KEY_RE.match(key)
+    if m:
+        return m.group(1) + m.group(2).upper()
+    return key
+
+
 def _normalize_name(name: str) -> str:
     """Strip number prefix, punctuation, and whitespace for fuzzy matching."""
     name = re.sub(r'^\d+[A-Za-z]?\.\s*', '', name)       # "71. Durum Kebab" → "Durum Kebab"
@@ -225,7 +242,8 @@ def scrape_menu(page: Page) -> tuple[dict, dict, dict]:
 
     Returns ``(menu, item_id_index, name_index)`` where:
 
-    * **menu** — keyed by the menu number / named-item identifier:
+    * **menu** — keyed by the menu number / named-item identifier, with the
+      suffix letter canonicalised by :func:`normalize_menu_key`:
       ``"9"``, ``"12A"``, ``"Børnepizza 5"``, ``"132"``
     * **item_id_index** — keyed by the raw ``showItemDetails()`` argument
       (e.g. ``"86"``).  Used as a fallback when a numeric key is not
@@ -271,8 +289,8 @@ def scrape_menu(page: Page) -> tuple[dict, dict, dict]:
         # Also match lowercase suffixes like "75a."
         nm = re.match(r'^(\d+[A-Za-z]?)\.\s+', full_name)
         if nm:
-            num = nm.group(1)
-            menu[num] = entry
+            # Canonicalise the key so "75a" and "75A" resolve to the same item
+            menu[normalize_menu_key(nm.group(1))] = entry
         else:
             # --- named items without a number prefix (Børnepizza X, Pommes Frites, …)
             menu[full_name] = entry
@@ -287,7 +305,7 @@ def scrape_menu(page: Page) -> tuple[dict, dict, dict]:
             desc = desc_el.inner_text()
             for vm in re.finditer(r'(\d+)\.\s+(\S+)', desc):
                 variant_num = vm.group(1)
-                menu[variant_num] = {
+                menu[normalize_menu_key(variant_num)] = {
                     "item_id": item_id,
                     "select_prefix": variant_num,  # match option text that starts with this
                     "name": full_name,
@@ -359,7 +377,7 @@ def select_variant(page: Page, select_prefix: str | None) -> None:
     page.wait_for_function("() => window._toppingsDone === true", timeout=8000)
 
 
-def apply_modifications(page: Page, mods_text: str) -> None:
+def apply_modifications(page: Page, mods_text: str) -> list[str]:
     """
     Tick the extra-topping checkboxes that match the comma-separated
     modifications string from the spreadsheet (e.g. "chili, hvidløg").
@@ -368,13 +386,16 @@ def apply_modifications(page: Page, mods_text: str) -> None:
     Must be called AFTER select_variant(), since toppings are loaded
     dynamically via showItemToppings() when the variant select changes.
     Operates via page.evaluate to avoid stale element handle issues.
+
+    Returns the list of requested modifications that had no matching
+    checkbox (empty when everything was applied).
     """
     if not mods_text:
-        return
+        return []
 
     mods = [m.strip().lower() for m in mods_text.split(",") if m.strip()]
     if not mods:
-        return
+        return []
 
     # Wait for toppings to be present
     try:
@@ -384,7 +405,7 @@ def apply_modifications(page: Page, mods_text: str) -> None:
         )
     except Exception:
         print("    ⚠ no checkboxes appeared — skipping modifications")
-        return
+        return mods
 
     # Do matching and checking entirely in JS to avoid stale element handle issues
     results = page.evaluate(
@@ -424,18 +445,83 @@ def apply_modifications(page: Page, mods_text: str) -> None:
         mods,
     )
 
+    unmatched = []
     for r in results:
         if r["found"]:
             print(f"    ✓ modification: {r['label']!r}")
         else:
             print(f"    ⚠ no checkbox found for modification: {r['mod']!r}")
+            unmatched.append(r["mod"])
+    return unmatched
 
 
-def add_to_cart(page: Page) -> None:
-    """Click the Tilføj (add to cart) button and wait for the modal to close."""
+# ---------------------------------------------------------------------------
+# Cart verification
+# ---------------------------------------------------------------------------
+
+_CART_STATE_JS = r"""
+() => {
+    const qtyEl = document.querySelector('#itmTypeQty');
+    const totalEl = document.querySelector('#totalPrice');
+    if (!qtyEl || !totalEl) return null;
+
+    // Each cart line renders "<qty> × <name>", so summing the leading
+    // quantities gives the number of items actually in the cart.
+    let units = 0;
+    for (const el of document.querySelectorAll('#orderList .cartitem .itemname')) {
+        const m = (el.textContent || '').trim().match(/^(\d+)\s*×/);
+        units += m ? parseInt(m[1], 10) : 1;
+    }
+
+    return {
+        units: units,
+        types: parseInt(qtyEl.textContent.trim() || '0', 10),
+        total: totalEl.textContent.trim(),
+    };
+}
+"""
+
+
+def read_cart(page: Page) -> dict | None:
+    """Read the cart summary from the sidebar.
+
+    Returns ``{"units": int, "types": int, "total": str}`` or ``None`` when the
+    cart widgets are not present on the page.
+    """
+    try:
+        return page.evaluate(_CART_STATE_JS)
+    except Exception:
+        return None
+
+
+def add_to_cart(page: Page, timeout_ms: int = 8000) -> dict | None:
+    """Click the Tilføj (add to cart) button and confirm the item really landed.
+
+    The overlay only tells us the AJAX call finished; the cart sidebar is
+    refreshed by a separate request, so poll it until the item shows up.
+    Raises if nothing changed, so a silently rejected item can no longer be
+    reported as "✓ Added to cart".
+    """
+    before = read_cart(page)
     page.click("input[value='Tilføj']")
     # With $.fx.off=true the overlay disappears as soon as the AJAX completes.
     page.wait_for_selector("#cboxOverlay", state="hidden", timeout=10000)
+
+    if before is None:
+        return None  # cart sidebar unavailable — cannot verify
+
+    deadline = time.monotonic() + (timeout_ms / 1000)
+    after = before
+    while time.monotonic() < deadline:
+        after = read_cart(page) or before
+        if after["units"] > before["units"] or after["total"] != before["total"]:
+            return after
+        time.sleep(0.2)
+
+    raise RuntimeError(
+        "item did not show up in the cart "
+        f"(cart still {after['units']} item(s), {after['total']})"
+    )
 
 
 def _pickup_selected_js() -> str:
@@ -793,7 +879,11 @@ def open_working_menu_page(page: Page, pizza_url: str) -> None:
 # ---------------------------------------------------------------------------
 
 def place_orders(orders: list[dict], pizza_url: str,
-                 email: str | None = None, password: str | None = None) -> None:
+                 email: str | None = None, password: str | None = None) -> int:
+    """Add every order to the cart, then wait for the user to check out.
+
+    Returns the number of orders that could NOT be added (0 = all good).
+    """
     with sync_playwright() as p:
         browser = p.chromium.launch(
             headless=False,
@@ -898,11 +988,22 @@ def place_orders(orders: list[dict], pizza_url: str,
               f"{len(name_index)} by name)\n")
 
         # 5. Process each order
+        added: list[dict] = []      # orders that made it into the cart
+        problems: list[dict] = []   # orders that did NOT make it into the cart
+        warnings: list[str] = []    # modifications that could not be applied
+
+        # Case-insensitive index over the spreadsheet Menu keys ("75a" → "75A")
+        ss_by_key = {normalize_menu_key(k): v for k, v in ss_menu.items()}
+
         for idx, order in enumerate(orders, 1):
             navn   = order.get("Navn", "?")
             nr     = order.get("Nr", "")
             mods   = order.get("Tilbehør") or ""
             price  = order.get("Pris (tekst)", "")
+
+            def skip(reason: str) -> None:
+                print(f"    ✗ {reason} — skipping\n")
+                problems.append({"navn": navn, "nr": nr, "reason": reason})
 
             print(f"[{idx}/{len(orders)}] {navn}: {nr}  {price}")
             if mods:
@@ -915,13 +1016,22 @@ def place_orders(orders: list[dict], pizza_url: str,
             #   → key="71", select_prefix overridden to "Fuldkorn"
             nr_parts = nr.split(" - ")
             key = nr_parts[0].strip()  # "9", "12A", "Børnepizza 5", "132"
+            menu_key = normalize_menu_key(key)
             # A third segment (e.g. "Fuldkorn") overrides the menu's select_prefix
             nr_variant = nr_parts[2].strip() if len(nr_parts) > 2 else None
+            # The item name as written in the order (e.g. "Durum Kebab Kylling
+            # & Bacon") — used to find items the Menu sheet doesn't know about.
+            order_name = nr_parts[1].strip() if len(nr_parts) > 1 else ""
 
             entry = None
 
+            # Website items whose name matches the name written in the order
+            order_name_matches = (
+                name_index.get(_normalize_name(order_name), []) if order_name else []
+            )
+
             # Does the spreadsheet Menu know about this key?
-            ss_item = ss_menu.get(key)
+            ss_item = ss_by_key.get(menu_key)
 
             if ss_item is not None:
                 # --- Spreadsheet-driven lookup: find the website item by
@@ -934,7 +1044,7 @@ def place_orders(orders: list[dict], pizza_url: str,
                     # Multiple matches — prefer the one whose menu number
                     # matches the spreadsheet key.
                     for candidate in name_matches:
-                        if menu.get(key) is candidate:
+                        if menu.get(menu_key) is candidate:
                             entry = candidate
                             break
                     if entry is None:
@@ -947,10 +1057,15 @@ def place_orders(orders: list[dict], pizza_url: str,
                 # create false positives (e.g. "86" → item_id=86 → "Stærk
                 # Durum" which is a different item than "Kebab Sandwich").
                 if entry is None:
-                    entry = menu.get(key)
+                    entry = menu.get(menu_key)
             else:
                 # --- Website-driven lookup (key not in spreadsheet Menu) ---
-                entry = menu.get(key)
+                entry = menu.get(menu_key)
+                if entry is None and len(order_name_matches) == 1:
+                    # The Menu sheet doesn't list this key at all, so go by the
+                    # name written in the order (matches by normalised item
+                    # name, e.g. "75A - Durum Kebab Kylling & Bacon").
+                    entry = order_name_matches[0]
                 if entry is None:
                     # Fall back to raw website item_id (some spreadsheets
                     # use the internal site ID instead of the menu number).
@@ -958,10 +1073,14 @@ def place_orders(orders: list[dict], pizza_url: str,
 
             if entry is None:
                 if ss_item is not None:
-                    print(f"    ✗ '{ss_item['name']}' (key {key!r}) "
-                          f"is in the spreadsheet Menu but NOT on the website — skipping\n")
+                    skip(f"'{ss_item['name']}' (key {key!r}) is in the spreadsheet "
+                         f"Menu but NOT on the website")
+                elif len(order_name_matches) > 1:
+                    candidates = ", ".join(e["name"] for e in order_name_matches)
+                    skip(f"{key!r} ({order_name!r}) is ambiguous on the website: "
+                         f"{candidates}")
                 else:
-                    print(f"    ✗ Item {key!r} not found in menu — skipping\n")
+                    skip(f"item {key!r} not found in menu")
                 continue
 
             item_id       = entry["item_id"]
@@ -997,15 +1116,25 @@ def place_orders(orders: list[dict], pizza_url: str,
                 select_variant(page, select_prefix)
 
                 # --- Tick modification checkboxes ----------------------------
-                apply_modifications(page, mods)
+                unmatched = apply_modifications(page, mods)
 
                 # --- Add to cart ---------------------------------------------
-                add_to_cart(page)
+                cart = add_to_cart(page)
                 elapsed = time.monotonic() - item_start
-                print(f"    ✓ Added to cart ({elapsed:.1f}s)\n")
+                cart_note = ""
+                if cart is not None:
+                    cart_note = f" — cart now {cart['units']} item(s), {cart['total']}"
+                print(f"    ✓ Added to cart ({elapsed:.1f}s){cart_note}\n")
+                if unmatched:
+                    warnings.append(
+                        f"{navn}: no topping found for "
+                        f"{', '.join(repr(m) for m in unmatched)} ({nr})"
+                    )
+                added.append({"navn": navn, "nr": nr})
             except Exception as e:
                 elapsed = time.monotonic() - item_start
                 print(f"    ✗ FAILED after {elapsed:.1f}s: {e}")
+                problems.append({"navn": navn, "nr": nr, "reason": str(e)})
                 # Force-close any open colorbox overlay so subsequent items can proceed
                 page.evaluate("""
                     () => {
@@ -1018,8 +1147,23 @@ def place_orders(orders: list[dict], pizza_url: str,
                 """)
                 continue
 
+        # --- Summary -----------------------------------------------------
+        cart = read_cart(page)
         print("=" * 60)
-        print(f"✓ All {len(orders)} orders added to cart.")
+        if problems:
+            print(f"⚠ {len(added)} of {len(orders)} orders were added to the cart — "
+                  f"{len(problems)} NOT added:")
+            for problem in problems:
+                print(f"    ✗ {problem['navn']}: {problem['nr']} — {problem['reason']}")
+            print("  Add the missing item(s) manually in the browser.")
+        else:
+            print(f"✓ All {len(orders)} orders added to cart.")
+        if cart is not None:
+            print(f"  Cart holds {cart['units']} item(s) — {cart['total']}")
+        if warnings:
+            print("  Warnings:")
+            for w in warnings:
+                print(f"    ⚠ {w}")
         print("  The browser is open — complete and submit the order.")
         print("  Press Enter here when done to close the browser.")
         print("=" * 60)
@@ -1029,6 +1173,9 @@ def place_orders(orders: list[dict], pizza_url: str,
             print("No interactive stdin available; closing browser.")
         context.close()
         browser.close()
+
+    # Number of orders that never made it into the cart
+    return len(problems)
 
 
 # ---------------------------------------------------------------------------
@@ -1069,7 +1216,10 @@ def main():
             print(f"  {o['Navn']}: {o['Nr']}{mods}")
         print()
 
-    place_orders(orders, pizza_url, email=email, password=password)
+    missing = place_orders(orders, pizza_url, email=email, password=password)
+    if missing:
+        print(f"\n✗ {missing} of {len(orders)} order(s) were not added to the cart.")
+        sys.exit(1)
 
 
 if __name__ == "__main__":

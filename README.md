@@ -69,7 +69,14 @@ This will:
 2. Open a visible Chromium browser on the pizza site
 3. Accept the cookie banner and select pickup (Afhentning)
 4. Add every order to the cart, including modifications
-5. Leave the browser open — review the cart and submit the order yourself, then press Enter to close the browser
+5. Verify in the cart sidebar that each item really landed, and report the ones
+   it could not place (with the reason)
+6. Leave the browser open — review the cart and submit the order yourself, then press Enter to close the browser
+
+Item numbers are matched case-insensitively (`75a` on the site = `75A` in the
+spreadsheet), and items the `Menu` sheet doesn't list are resolved by the name
+written in the `Nr` column. If any order cannot be added, the summary lists it
+and `place-orders` exits with a non-zero status.
 
 The configured `PIZZA_PLACE` may be either the site root (for example
 `https://skalborgpizza.dk`) or the direct menu URL. The script normalizes it to
